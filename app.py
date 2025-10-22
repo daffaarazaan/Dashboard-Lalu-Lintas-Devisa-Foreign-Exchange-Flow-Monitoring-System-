@@ -7,7 +7,18 @@
 # Run: pip install streamlit pandas numpy plotly scikit-learn
 #      streamlit run streamlit_app.py
 
+# di paling atas file streamlit_app.py
+import importlib
 import streamlit as st
+
+if importlib.util.find_spec("plotly.express") is None:
+    st.error("Package `plotly` belum terinstall pada runtime. "
+             "Pastikan `plotly` tercantum pada requirements.txt dan redeploy. "
+             "Untuk debug lokal: pip install plotly")
+    st.stop()
+
+# jika ada, import normal
+import plotly.express as px
 import pandas as pd
 import numpy as np
 import plotly.express as px
