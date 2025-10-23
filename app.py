@@ -1,320 +1,314 @@
 # app.py
-# Remade safe Streamlit app for FX Flow Monitoring
-# - Uses safe try/except imports to avoid ModuleNotFoundError crashes
-# - Gives friendly UI error messages if dependencies or data files are missing
-# - Expects CSV data files in repo root:
-#     - inflow_outflow_long_cleaned.csv
-#     - inflow_outflow_quarterly_agg.csv
-#
-# Run: streamlit run app.py
-
 import streamlit as st
-
-# ---------------------------
-# Safe import block
-# ---------------------------
-missing_core = []
-_plotly_ok = False
-_pandas_ok = False
-_numpy_ok = False
-_sklearn_ok = False
-
-# pandas
-try:
-    import pandas as pd
-    _pandas_ok = True
-except Exception as e:
-    missing_core.append(("pandas", str(e)))
-
-# numpy
-try:
-    import numpy as np
-    _numpy_ok = True
-except Exception as e:
-    missing_core.append(("numpy", str(e)))
-
-# plotly (required for charts)
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-    _plotly_ok = True
-except Exception as e:
-    # Capture the exception message for display (helpful for debugging)
-    _plotly_err_msg = str(e)
-    _plotly_ok = False
-
-# sklearn for simple linear regression forecasting (optional fallback implemented)
-try:
-    from sklearn.linear_model import LinearRegression
-    _sklearn_ok = True
-except Exception as e:
-    _sklearn_ok = False
-    _sklearn_err_msg = str(e)
-
-# If any core libs missing, show friendly message and stop.
-if not (_pandas_ok and _numpy_ok and _plotly_ok):
-    st.set_page_config(page_title="FX Flow Monitoring - Error", layout="wide")
-    st.title("FX Flow Monitoring — startup error")
-    if not _pandas_ok or not _numpy_ok:
-        st.error("Core Python packages missing or failed to import.")
-        st.write("Missing or failed imports:")
-        if not _pandas_ok:
-            st.write("- pandas (required)")
-        if not _numpy_ok:
-            st.write("- numpy (required)")
-        st.write("\nMake sure your `requirements.txt` includes the packages and redeploy.")
-        st.write("Recommended minimal `requirements.txt` entries:")
-        st.code("streamlit==1.38.0\npandas==2.2.2\nnumpy==1.26.4\nplotly==5.24.1\nscikit-learn==1.5.2")
-        st.stop()
-    # plotly missing
-    if not _plotly_ok:
-        st.error("plotly failed to import — plotting library is required for this app.")
-        st.write("Possible causes:")
-        st.write("• `plotly` missing from requirements.txt; or")
-        st.write("• installation failed during build (check build logs in Streamlit Cloud -> Manage app -> Logs).")
-        st.write("Captured import error (for debugging):")
-        st.code(_plotly_err_msg)
-        st.write("\nRecommended action: ensure `plotly==5.24.1` is present in `requirements.txt`, commit & redeploy.")
-        st.stop()
-
-# ---------------------------
-# Normal imports after safe check
-# ---------------------------
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 from datetime import datetime
-from pathlib import Path
+import io
 
-st.set_page_config(layout="wide", page_title="FX Flow Monitoring", initial_sidebar_state="expanded")
+# forecasting library (statsmodels)
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    HAS_STATS = True
+except Exception as e:
+    HAS_STATS = False
 
-# ---------------------------
-# Data loading with friendly messages
-# ---------------------------
-DATA_LONG = "inflow_outflow_long_cleaned.csv"
-DATA_Q = "inflow_outflow_quarterly_agg.csv"
+st.set_page_config(layout="wide", page_title="FX Flow Monitoring (Streamlit)", initial_sidebar_state="expanded")
+
+#### Utility functions ####
+@st.cache_data
+def load_quarterly(path="/mnt/data/inflow_outflow_quarterly_agg.csv"):
+    df = pd.read_csv(path)
+    # normalize date
+    df['period_ts'] = pd.to_datetime(df['period_ts'])
+    df = df.sort_values('period_ts').reset_index(drop=True)
+    # ensure numeric
+    numeric_cols = [c for c in df.columns if c not in ['period_ts']]
+    for c in numeric_cols:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    # computed fields
+    if 'net_flow_signed_musd' not in df.columns:
+        df['net_flow_signed_musd'] = df.get('total_inflow_musd',0) - df.get('total_outflow_musd',0)
+    return df
 
 @st.cache_data
-def load_data(path_long: str, path_q: str):
-    errors = []
-    d_long = pd.DataFrame()
-    d_q = pd.DataFrame()
+def load_long(path="/mnt/data/inflow_outflow_long_cleaned.csv"):
+    df = pd.read_csv(path)
+    # normalize
+    if 'period_ts' in df.columns:
+        df['period_ts'] = pd.to_datetime(df['period_ts'])
+    else:
+        # try period_raw like "2010q1"
+        if 'period_raw' in df.columns:
+            df['period_ts'] = df['period_raw'].apply(lambda x: pd.Period(x).end_time if isinstance(x,str) else pd.NaT)
+    # ensure numeric value column names (common names in your data)
+    for c in ['value_signed_musd','value_musd','value_raw','value']:
+        if c in df.columns:
+            df['value_musd'] = pd.to_numeric(df[c], errors='coerce')
+            break
+    # standardize columns
+    if 'flow_class' not in df.columns:
+        # try to infer from sign
+        if 'value_musd' in df.columns:
+            df['flow_class'] = df['value_musd'].apply(lambda x: 'inflow' if x>=0 else 'outflow')
+    # optionally create item_simple
+    if 'item' in df.columns:
+        df['item_simple'] = df['item'].astype(str)
+    return df
+
+def compute_anomalies(df_quarterly, z_thresh=3.0):
+    # anomaly detection on net flow signed using z-score
+    s = df_quarterly['net_flow_signed_musd'].dropna()
+    mean = s.mean(); std = s.std()
+    df = df_quarterly.copy()
+    df['net_zscore'] = (df['net_flow_signed_musd'] - mean) / std
+    df['anomaly_flag'] = df['net_zscore'].abs() > z_thresh
+    return df, mean, std
+
+def forecast_series(series, periods=2, seasonal_periods=4):
+    """
+    Forecast using ExponentialSmoothing if available.
+    Returns forecast_index (DatetimeIndex), forecast (array), lower, upper
+    If statsmodels not available, simple naive forecast (last value) with +/- std as CI.
+    """
+    series = series.dropna()
+    if len(series) < 4 or not HAS_STATS:
+        last = series.iloc[-1] if len(series)>0 else 0.0
+        forecast = np.array([last]*periods)
+        resid_std = series.diff().std() if len(series)>1 else 0.0
+        lower = forecast - 1.96*resid_std
+        upper = forecast + 1.96*resid_std
+        last_idx = series.index[-1]
+        # assume quarterly frequency
+        try:
+            freq = pd.infer_freq(series.index)
+        except:
+            freq = None
+        if hasattr(last_idx, 'to_period'):
+            idx = pd.period_range(start=last_idx.to_period('Q') + 1, periods=periods, freq='Q').to_timestamp(how='end')
+        else:
+            idx = pd.date_range(start=series.index[-1] + pd.offsets.QuarterEnd(), periods=periods, freq='Q')
+        return idx, forecast, lower, upper
+    # Use Holt-Winters
     try:
-        d_long = pd.read_csv(path_long, parse_dates=["period_ts"])
-    except FileNotFoundError:
-        errors.append(f"File not found: {path_long}")
+        model = ExponentialSmoothing(series, seasonal='add', seasonal_periods=seasonal_periods, trend='add', damped_trend=False)
+        fit = model.fit(optimized=True)
+        pred = fit.forecast(periods)
+        resid = fit.resid
+        resid_std = resid.std() if resid is not None else 0.0
+        lower = pred - 1.96*resid_std
+        upper = pred + 1.96*resid_std
+        # forecast index
+        last_ts = series.index[-1]
+        if isinstance(last_ts, pd.Timestamp):
+            idx = pd.date_range(start=last_ts + pd.offsets.QuarterEnd(), periods=periods, freq='Q')
+        else:
+            idx = pd.RangeIndex(start=len(series), stop=len(series)+periods)
+        return idx, pred.values, lower.values, upper.values
     except Exception as e:
-        errors.append(f"Failed to read {path_long}: {e}")
+        # fallback naive
+        last = series.iloc[-1] if len(series)>0 else 0.0
+        forecast = np.array([last]*periods)
+        resid_std = series.diff().std() if len(series)>1 else 0.0
+        lower = forecast - 1.96*resid_std
+        upper = forecast + 1.96*resid_std
+        last_idx = series.index[-1]
+        try:
+            idx = pd.date_range(start=series.index[-1] + pd.offsets.QuarterEnd(), periods=periods, freq='Q')
+        except:
+            idx = np.arange(len(series), len(series)+periods)
+        return idx, forecast, lower, upper
 
-    try:
-        d_q = pd.read_csv(path_q, parse_dates=["period_ts"])
-    except FileNotFoundError:
-        errors.append(f"File not found: {path_q}")
-    except Exception as e:
-        errors.append(f"Failed to read {path_q}: {e}")
+def df_to_csv_bytes(df):
+    return df.to_csv(index=False).encode('utf-8')
 
-    # Attempt minimal sanitization if data loaded
-    if not d_long.empty:
-        if "value_signed_musd" in d_long.columns:
-            d_long["value_signed_musd"] = pd.to_numeric(d_long["value_signed_musd"], errors="coerce")
-        # Ensure item_simple and flow_class exist
-        if "item_simple" not in d_long.columns:
-            d_long["item_simple"] = d_long.columns[0] if len(d_long.columns) > 0 else "unknown"
-        if "flow_class" not in d_long.columns:
-            d_long["flow_class"] = "unknown"
-
-    if not d_q.empty:
-        for col in d_q.columns:
-            if col != "period_ts":
-                d_q[col] = pd.to_numeric(d_q[col], errors="coerce")
-
-    return d_long, d_q, errors
-
-d_long, d_q, load_errors = load_data(DATA_LONG, DATA_Q)
-
-if load_errors:
-    st.title("FX Flow Monitoring — data load error")
-    st.error("One or more data files failed to load.")
-    for e in load_errors:
-        st.write("- " + e)
-    st.write("\nMake sure the CSV files are committed to the repository and paths are correct.")
-    st.write("Expected filenames (in repo root):")
-    st.code(f"{DATA_LONG}\n{DATA_Q}")
-    st.stop()
-
-# Ensure we have at least minimal data structure to proceed
-if d_long.empty and d_q.empty:
-    st.title("FX Flow Monitoring — no data available")
-    st.error("Both datasets are empty. Please provide the required CSV files and redeploy.")
-    st.stop()
-
-# ---------------------------
-# Helper functions
-# ---------------------------
-def rolling_mean(series, window):
-    return series.rolling(window=window, min_periods=1).mean()
-
-def linear_forecast_one_step(df_q, target_col="total_inflow_musd"):
-    # Simple linear trend model (requires scikit-learn)
-    df = df_q.dropna(subset=[target_col]).sort_values("period_ts").reset_index(drop=True)
-    if df.shape[0] < 3 or not _sklearn_ok:
-        # fallback: return last value as naive forecast
-        last = df[target_col].iloc[-1] if not df.empty else 0.0
-        return float(last), float(last), float(last), None
-    X = np.arange(len(df)).reshape(-1,1)
-    y = df[target_col].values.reshape(-1,1)
-    model = LinearRegression().fit(X, y)
-    next_X = np.array([[len(df)]])
-    pred = float(model.predict(next_X)[0,0])
-    resid = y.flatten() - model.predict(X).flatten()
-    se = resid.std(ddof=1)/np.sqrt(len(resid)) if len(resid) > 1 else resid.std(ddof=0)
-    ci = 1.96 * se
-    return pred, pred - ci, pred + ci, model
-
-# ---------------------------
-# App layout & pages
-# ---------------------------
+#### Load data ####
 st.sidebar.title("FX Flow Monitoring")
-page = st.sidebar.radio("Pilih halaman:", ["Overview", "Breakdown", "Compliance", "Forecast", "Data Preview"])
+st.sidebar.markdown("Data source (auto-loaded from `/mnt/data`)")
+df_q = load_quarterly()
+df_l = load_long()
 
-# Prepare quarterly df sorted
-if not d_q.empty and "period_ts" in d_q.columns:
-    d_q = d_q.sort_values("period_ts").reset_index(drop=True)
+# Sidebar controls
+st.sidebar.subheader("Controls")
+z_threshold = st.sidebar.slider("Anomaly z-threshold (net flow)", 1.5, 5.0, 3.0, step=0.1)
+forecast_periods = st.sidebar.selectbox("Forecast horizon (quarters)", [1,2,4], index=1)
+selected_start = st.sidebar.date_input("Start date", value=df_q['period_ts'].min().date())
+selected_end = st.sidebar.date_input("End date", value=df_q['period_ts'].max().date())
 
-latest_q = d_q["period_ts"].max() if not d_q.empty else None
-latest_row = d_q.loc[d_q["period_ts"] == latest_q].iloc[0] if (latest_q is not None and not d_q.empty) else None
+# Page navigation
+page = st.sidebar.radio("Select page", ["Overview","Breakdown","Compliance","Forecast","Data"])
 
-# ---------- Overview ----------
+#### Overview Page ####
 if page == "Overview":
-    st.title("Overview — Foreign Exchange Inflow / Outflow")
-    if latest_row is not None:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Latest quarter", latest_q.strftime("%Y-%m-%d"))
-        c2.metric("Total Inflow (latest)", f"{int(latest_row.get('total_inflow_musd', 0)):,} USD")
-        c3.metric("Total Outflow (latest)", f"{int(latest_row.get('total_outflow_musd', 0)):,} USD")
-        c4.metric("Net Flow (latest)", f"{int(latest_row.get('net_flow_signed_musd', 0)):,} USD")
-    else:
-        st.warning("Quarterly aggregated dataset tersedia tapi tidak ada baris dengan nilai valid.")
+    st.title("Overview — Foreign Exchange Flow Monitoring")
+    st.markdown("High-level summary of inflow, outflow, net flow and reserve changes (quarterly).")
+    mask = (df_q['period_ts'].dt.date >= selected_start) & (df_q['period_ts'].dt.date <= selected_end)
+    df_view = df_q.loc[mask].copy()
+    # KPIs
+    col1, col2, col3, col4 = st.columns(4)
+    total_inflow = df_view['total_inflow_musd'].sum()
+    total_outflow = df_view['total_outflow_musd'].sum()
+    total_net = df_view['net_flow_signed_musd'].sum()
+    reserve_change = df_view['reserve_change_musd'].iloc[-1] if 'reserve_change_musd' in df_view.columns else np.nan
 
-    st.markdown("### Quarterly time series")
-    if not d_q.empty:
-        fig = go.Figure()
-        if "total_inflow_musd" in d_q.columns:
-            fig.add_trace(go.Scatter(x=d_q["period_ts"], y=d_q["total_inflow_musd"], mode="lines+markers", name="Total Inflow"))
-        if "total_outflow_musd" in d_q.columns:
-            fig.add_trace(go.Scatter(x=d_q["period_ts"], y=d_q["total_outflow_musd"], mode="lines+markers", name="Total Outflow"))
-        fig.update_layout(legend=dict(y=0.99, x=0.01))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Aggregate quarterly dataset kosong — tidak ada timeseries yang dapat ditampilkan.")
+    col1.metric("Total Inflow (selected)", f"${total_inflow:,.0f} M")
+    col2.metric("Total Outflow (selected)", f"${total_outflow:,.0f} M")
+    col3.metric("Net Flow (selected)", f"${total_net:,.0f} M")
+    col4.metric("Reserve change (last)", f"${reserve_change:,.0f} M")
 
-    st.markdown("### Net flow and rolling average (4 quarters)")
-    if "net_flow_signed_musd" in d_q.columns:
-        d_q["rolling4_net"] = d_q["net_flow_signed_musd"].rolling(window=4, min_periods=1).mean()
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(x=d_q["period_ts"], y=d_q["net_flow_signed_musd"], name="Net Flow"))
-        fig2.add_trace(go.Line(x=d_q["period_ts"], y=d_q["rolling4_net"], name="Rolling4 Avg", line=dict(width=3)))
-        st.plotly_chart(fig2, use_container_width=True)
+    # Time series
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df_view['period_ts'], y=df_view['total_inflow_musd'],
+                             mode='lines+markers', name='Inflow', line=dict(color='green')))
+    fig.add_trace(go.Scatter(x=df_view['period_ts'], y=df_view['total_outflow_musd'],
+                             mode='lines+markers', name='Outflow', line=dict(color='red')))
+    fig.update_layout(title="Quarterly Inflow & Outflow", xaxis_title="Quarter", yaxis_title="USD (M)")
+    st.plotly_chart(fig, use_container_width=True)
 
-    if "net_flow_signed_musd" in d_q.columns:
-        d_q["net_yoy_pct"] = d_q["net_flow_signed_musd"].pct_change(periods=4)
-        st.markdown("### YoY Growth of Net Flow (percent)")
-        st.line_chart(d_q.set_index("period_ts")["net_yoy_pct"].dropna())
+    # Net flow area
+    fig2 = px.area(df_view, x='period_ts', y='net_flow_signed_musd', title="Net Flow (Inflow - Outflow) (M USD)")
+    st.plotly_chart(fig2, use_container_width=True)
 
-# ---------- Breakdown ----------
+    # YoY growth (inflow)
+    df_view = df_view.set_index('period_ts').sort_index()
+    yoy = df_view['total_inflow_musd'].pct_change(4) * 100
+    fig3 = go.Figure()
+    fig3.add_trace(go.Bar(x=yoy.index, y=yoy.values, name='YoY Inflow %', marker_color='blue'))
+    fig3.update_layout(title="YoY Growth in Inflow (%)", xaxis_title="Quarter")
+    st.plotly_chart(fig3, use_container_width=True)
+
+    # Rolling 4-quarter average for net flow
+    df_view['rolling_4q'] = df_view['net_flow_signed_musd'].rolling(window=4).mean()
+    fig4 = go.Figure()
+    fig4.add_trace(go.Scatter(x=df_view.index, y=df_view['net_flow_signed_musd'], mode='lines', name='Net Flow'))
+    fig4.add_trace(go.Scatter(x=df_view.index, y=df_view['rolling_4q'], mode='lines', name='Rolling 4Q Avg', line=dict(dash='dash')))
+    fig4.update_layout(title="Net Flow & Rolling 4-Quarter Average")
+    st.plotly_chart(fig4, use_container_width=True)
+
+#### Breakdown Page ####
 elif page == "Breakdown":
-    st.title("Breakdown — by sector and flow_class")
-    st.markdown("Filter the time range and flow direction to inspect components.")
+    st.title("Breakdown — Component & Country Analysis")
+    st.markdown("Use the long (item-level) dataset for sectoral and country breakdowns.")
+    # basic cleaning
+    dfl = df_l.copy()
+    # ensure period_ts present
+    if 'period_ts' not in dfl.columns:
+        st.warning("Long file doesn't have `period_ts`. Please check `period_raw` or `period` column.")
+    # filters
+    items = dfl['item_simple'].dropna().unique().tolist() if 'item_simple' in dfl.columns else dfl['item'].unique().tolist()
+    chosen_items = st.multiselect("Select items (components)", options=sorted(items), default=items[:6])
+    chosen_flow = st.selectbox("Flow class", options=['all','inflow','outflow'], index=0)
+    if 'value_musd' not in dfl.columns:
+        st.error("Long file does not contain a numeric 'value_musd' column. Check your file.")
+    # filter
+    mask = dfl['item_simple'].isin(chosen_items) if 'item_simple' in dfl.columns else dfl['item'].isin(chosen_items)
+    if chosen_flow!='all':
+        mask = mask & (dfl['flow_class']==chosen_flow)
+    dff = dfl.loc[mask].copy()
+    # aggregate per quarter & item
+    agg = dff.groupby([pd.Grouper(key='period_ts', freq='Q'), 'item_simple' if 'item_simple' in dff.columns else 'item'])['value_musd'].sum().reset_index()
+    agg = agg.rename(columns={'period_ts':'period_ts','value_musd':'amount_musd'})
 
-    min_date = st.date_input("Start date", d_long["period_ts"].min().date() if not d_long.empty else datetime(2010,1,1).date())
-    max_date = st.date_input("End date", d_long["period_ts"].max().date() if not d_long.empty else datetime.today().date())
-    flow_options = d_long["flow_class"].unique().tolist() if "flow_class" in d_long.columns else []
-    flow_sel = st.multiselect("Flow class", options=flow_options, default=flow_options)
+    st.subheader("Stacked area / column by quarter")
+    fig = px.bar(agg, x='period_ts', y='amount_musd', color='item_simple' if 'item_simple' in agg.columns else 'item',
+                 title="Component contributions per quarter (selected items)")
+    st.plotly_chart(fig, use_container_width=True)
 
-    mask = (d_long["period_ts"].dt.date >= min_date) & (d_long["period_ts"].dt.date <= max_date)
-    if flow_sel:
-        mask &= d_long["flow_class"].isin(flow_sel)
-    dff = d_long.loc[mask].copy()
-
-    if dff.empty:
-        st.info("Tidak ada data untuk filter yang dipilih.")
+    st.subheader("Treemap: Share by component (selected period)")
+    # select single quarter
+    quarter = st.selectbox("Select quarter (for treemap)", options=sorted(agg['period_ts'].dt.to_period('Q').astype(str).unique()), index=-1)
+    q_ts = pd.Period(quarter).end_time
+    treedf = agg[agg['period_ts']==q_ts]
+    if treedf.empty:
+        st.info("No data for selected quarter.")
     else:
-        st.markdown("#### Stacked contributions by item")
-        stacked = dff.groupby(["period_ts","item_simple"], as_index=False)["value_signed_musd"].sum()
-        fig = px.bar(stacked, x="period_ts", y="value_signed_musd", color="item_simple", title="Contributions by Item (stacked)")
-        st.plotly_chart(fig, use_container_width=True)
-
-        st.markdown("#### Top items (aggregate over selected period)")
-        agg = dff.groupby("item_simple", as_index=False)["value_signed_musd"].sum().sort_values("value_signed_musd", ascending=False).head(20)
-        fig2 = px.bar(agg, x="value_signed_musd", y="item_simple", orientation="h", title="Top items by sum(value)")
+        fig2 = px.treemap(treedf, path=[treedf.columns[1]], values='amount_musd', title=f"Share by component — {quarter}")
         st.plotly_chart(fig2, use_container_width=True)
 
-        st.markdown("#### Matrix (pivot-like)")
-        pivot = dff.pivot_table(index="item_simple", columns="period_ts", values="value_signed_musd", aggfunc="sum").fillna(0)
-        st.dataframe(pivot.style.format("{:,.0f}"))
+    st.subheader("Raw table (filtered)")
+    st.dataframe(dff.sort_values('period_ts', ascending=False).reset_index(drop=True))
 
-# ---------- Compliance ----------
+#### Compliance Page ####
 elif page == "Compliance":
-    st.title("Compliance — missing data & anomaly detection")
-    st.markdown("Flags for missing data and z-score based anomaly detection by item")
+    st.title("Compliance & Anomaly Detection")
+    st.markdown("Monitor `errors & omissions`, flags for anomalies, and missing data metrics.")
 
-    if "value_signed_musd" not in d_long.columns:
-        st.warning("Kolom 'value_signed_musd' tidak ditemukan di dataset long. Pastikan file yang benar di-upload.")
+    df_q_anom, mean_net, std_net = compute_anomalies(df_q, z_thresh=z_threshold)
+    st.metric("Net flow mean (all)", f"${mean_net:,.0f} M")
+    st.metric("Net flow std (all)", f"${std_net:,.0f} M")
+    st.markdown(f"Using z-threshold = **{z_threshold}** → anomalies flagged when |z| > {z_threshold}")
+
+    # anomalies table
+    anomalies = df_q_anom[df_q_anom['anomaly_flag']]
+    st.subheader("Anomalous quarters (by net flow z-score)")
+    st.dataframe(anomalies[['period_ts','net_flow_signed_musd','net_zscore','errors_omissions_musd']].sort_values('period_ts', ascending=False))
+
+    # errors & omissions over time
+    if 'errors_omissions_musd' in df_q.columns:
+        fig = px.line(df_q, x='period_ts', y='errors_omissions_musd', title="Errors & Omissions (M USD)")
+        fig.add_hline(y=0, line_dash="dash", line_color="gray")
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        missing_summary = d_long[d_long["value_signed_musd"].isna()].groupby("item_simple").size().reset_index(name="missing_count").sort_values("missing_count", ascending=False)
-        st.subheader("Missing data summary (per item)")
-        if not missing_summary.empty:
-            st.dataframe(missing_summary)
-        else:
-            st.write("No missing values found in `value_signed_musd`.")
+        st.info("No `errors_omissions_musd` column in quarterly data.")
 
-        st.subheader("Anomaly detection (z-score within each item)")
-        dfz = d_long.dropna(subset=["value_signed_musd"]).copy()
-        dfz["zscore"] = dfz.groupby("item_simple")["value_signed_musd"].transform(lambda s: (s - s.mean()) / (s.std(ddof=0) if s.std(ddof=0) != 0 else 1.0))
-        threshold = st.slider("Z-score threshold", min_value=1.0, max_value=4.0, value=2.0, step=0.1)
-        anomalies = dfz.loc[dfz["zscore"].abs() > threshold].sort_values("zscore", ascending=False)
-        st.write(f"Detected {len(anomalies)} anomalies (|z| > {threshold})")
-        if not anomalies.empty:
-            st.dataframe(anomalies[["period_ts","item_simple","flow_class","value_signed_musd","zscore"]].reset_index(drop=True))
-            top_anom_items = anomalies["item_simple"].value_counts().head(6).index.tolist()
-            for item in top_anom_items:
-                subset = dfz[dfz["item_simple"]==item].sort_values("period_ts")
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=subset["period_ts"], y=subset["value_signed_musd"], mode="lines+markers", name=item))
-                anom_pts = anomalies[anomalies["item_simple"]==item]
-                fig.add_trace(go.Scatter(x=anom_pts["period_ts"], y=anom_pts["value_signed_musd"], mode="markers", marker=dict(color="red", size=10), name="Anomaly"))
-                st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.write("No anomalies detected with the current threshold.")
+    # missing data stats
+    st.subheader("Missing data summary (quarterly file)")
+    missing = df_q.isna().sum().reset_index()
+    missing.columns = ['column','n_missing']
+    st.table(missing)
 
-# ---------- Forecast ----------
+#### Forecast Page ####
 elif page == "Forecast":
-    st.title("Forecast — simple 1-quarter-ahead forecast (linear trend)")
-    st.markdown("Lightweight linear-trend forecast with approximate 95% CI. For production, use Prophet/ETS/ARIMA.")
-    metric_options = [c for c in ["total_inflow_musd","total_outflow_musd","net_flow_signed_musd"] if c in d_q.columns]
-    if not metric_options:
-        st.warning("Aggregate metrics for forecasting not found in quarterly dataset.")
-    else:
-        metric_choice = st.selectbox("Forecast target", options=metric_options, index=0)
-        pred, low, high, model = linear_forecast_one_step(d_q, target_col=metric_choice)
-        last_val = d_q[metric_choice].iloc[-1] if not d_q.empty else np.nan
-        st.metric(f"Forecast 1-quarter ahead for {metric_choice}", f"{pred:,.0f} USD", delta=f"{(pred - last_val):,.0f}")
-        st.write(f"Approx. 95% CI: [{low:,.0f}, {high:,.0f}]")
-        # Plot
-        hist = d_q.sort_values("period_ts").reset_index(drop=True).copy()
-        if not hist.empty:
-            next_period = hist["period_ts"].max() + pd.offsets.QuarterEnd(0)
-            plot_df = hist.copy()
-            fig = px.line(plot_df, x="period_ts", y=metric_choice, title=f"{metric_choice} history + 1q forecast")
-            fig.add_trace(go.Scatter(x=[next_period], y=[pred], mode="markers", marker=dict(size=10), name="Forecast"))
-            fig.add_trace(go.Scatter(x=[next_period, next_period], y=[low, high], mode="lines", line=dict(width=3, dash="dash"), name="CI"))
-            st.plotly_chart(fig, use_container_width=True)
+    st.title("Forecast — Simple Time Series Forecast")
+    st.markdown("Forecasting using Holt-Winters (additive seasonal) when available. If `statsmodels` not installed or data short, falls back to naive forecast.")
+    periods = forecast_periods
+    # choose series to forecast
+    series_choice = st.selectbox("Series to forecast", ['total_inflow_musd','total_outflow_musd','net_flow_signed_musd'])
+    s = df_q.set_index('period_ts')[series_choice]
+    idx, pred, lower, upper = forecast_series(s, periods=periods, seasonal_periods=4)
+    # plot historic + forecast
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=s.index, y=s.values, mode='lines+markers', name='Historical'))
+    # forecast
+    fig.add_trace(go.Scatter(x=idx, y=pred, mode='lines+markers', name='Forecast', line=dict(color='orange')))
+    fig.add_trace(go.Scatter(x=idx, y=upper, mode='lines', name='Upper CI', line=dict(dash='dot'), marker_color='lightgrey', showlegend=False))
+    fig.add_trace(go.Scatter(x=idx, y=lower, mode='lines', name='Lower CI', line=dict(dash='dot'), marker_color='lightgrey', showlegend=False))
+    # fill between
+    fig.add_traces([go.Scatter(
+        x = list(idx) + list(idx[::-1]),
+        y = list(upper) + list(lower[::-1]),
+        fill='toself',
+        fillcolor='rgba(255,165,0,0.1)',
+        line=dict(color='rgba(255,255,255,0)'),
+        hoverinfo="skip",
+        showlegend=False
+    )])
+    fig.update_layout(title=f"Forecast for {series_choice} ({periods} quarters)", xaxis_title="Quarter", yaxis_title="USD (M)")
+    st.plotly_chart(fig, use_container_width=True)
 
-# ---------- Data Preview ----------
-elif page == "Data Preview":
-    st.title("Data preview")
-    st.subheader("Long cleaned dataset (head)")
-    st.dataframe(d_long.head(200))
-    st.subheader("Quarterly aggregated dataset (head)")
-    st.dataframe(d_q.head(200))
+    # show forecast table
+    fc_df = pd.DataFrame({
+        'period': idx,
+        'forecast_musd': pred,
+        'lower_ci': lower,
+        'upper_ci': upper
+    })
+    st.subheader("Forecast numbers")
+    st.dataframe(fc_df)
 
-# Sidebar footer
+#### Data Page ####
+elif page == "Data":
+    st.title("Data Explorer & Download")
+    st.markdown("Preview and download the cleaned datasets used in the app.")
+    st.subheader("Quarterly aggregated file")
+    st.dataframe(df_q)
+    st.download_button("Download quarterly CSV", data=df_to_csv_bytes(df_q), file_name="inflow_outflow_quarterly_agg_cleaned.csv", mime="text/csv")
+
+    st.subheader("Long (item-level) file")
+    st.dataframe(df_l)
+    st.download_button("Download long CSV", data=df_to_csv_bytes(df_l), file_name="inflow_outflow_long_cleaned_export.csv", mime="text/csv")
+
 st.sidebar.markdown("---")
-st.sidebar.markdown("Prototype — Monitoring + Compliance + Forecast\nReplace forecasting with more advanced models for production.")
+st.sidebar.markdown("Made for: Daffa — FX Flow Monitoring prototype")
+st.sidebar.caption("Streamlit app generated by ChatGPT — edit & expand as needed.")
